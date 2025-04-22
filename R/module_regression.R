@@ -1,0 +1,311 @@
+library(shiny)
+library(dplyr)
+library(DT)
+library(plotly)
+library(httr)
+library(jsonlite)
+library(glmnet) 
+library(stats)  
+library(shinycssloaders) 
+library(nnet)   
+library(car)    
+library(rlang) 
+library(scales) 
+
+# --- UI Funkce Modulu ---
+regressionUI <- function(id) {
+  ns <- NS(id)
+  
+  tagList(
+    h3("Regresní Analýza"),
+    p("Vyberte závislou a nezávislé proměnné a metodu regrese. Můžete nechat metodu vybrat automaticky."),
+    fluidRow(
+      # --- Vstupní část (Původní) ---
+      column(4,
+             wellPanel(
+               tags$b("1. Výběr proměnných"),
+               selectInput(ns("y_var"), "Závislá proměnná (Y):", choices = NULL),
+               uiOutput(ns("x_var_ui_placeholder")),
+               tags$hr(),
+               tags$b("2. Výběr metody"),
+               selectInput(ns("method"), "Metoda regrese:",
+                           choices = c("Automaticky" = "auto", "Lineární (OLS)" = "ols", "Ridge" = "ridge", "Lasso" = "lasso", "ElasticNet" = "elasticnet", "Logistická (binární Y)" = "logistic", "Multinomiální (kategorické Y)" = "multinomial"),
+                           selected = "auto"),
+               actionButton(ns("run_analysis"), "Spustit Analýzu", icon = icon("play"), class = "btn-primary"),
+               uiOutput(ns("analysis_loading_ui"))
+             )
+      ), # konec column 4
+      
+
+      column(8,
+             h4("Výsledky Analýzy"),
+             uiOutput(ns("analysis_error_ui")), # Chyba analýzy
+             conditionalPanel(
+               condition = "output.showResults === true", 
+               ns = ns,
+               tagList(
+                 # Přehled modelu
+                 wellPanel(style = "background-color: #f8f9fa;", uiOutput(ns("model_summary_header_ui"))),
+                 # Koeficienty
+                 tags$h5("Koeficienty"),
+                 uiOutput(ns("coefficients_notes_ui")),
+                 DTOutput(ns("coefficients_table_dt")) %>% withSpinner(type = 4, color = "#0dc5c1"),
+                 # Grafy
+                 tags$h5("Grafy"),
+                 fluidRow(
+                   column(6, plotlyOutput(ns("scatter_plot")) %>% withSpinner(type = 4, color = "#0dc5c1")),
+                   column(6, plotlyOutput(ns("residuals_plot")) %>% withSpinner(type = 4, color = "#0dc5c1"))
+                 ),
+                 # AI Interpretace
+                 tags$hr(), tags$h5("AI Interpretace"),
+                 uiOutput(ns("ai_error_ui")), # Chyba AI
+                 uiOutput(ns("ai_interpretation_ui")) # Interpretace
+               ) # konec tagList
+             ) # konec conditionalPanel
+      ) # konec column 8
+    ) # konec fluidRow
+  ) # konec tagList
+}
+
+
+# --- Server Funkce Modulu ---
+regressionServer <- function(id, reactive_data, reactive_col_types) {
+  
+  moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+  
+    rv <- reactiveValues(analysis_results = NULL, selected_method_info = NULL, plot_data = NULL, interpretation_context = NULL, ai_interpretation = NULL, ai_error = NULL, is_interpreting = FALSE, is_analyzing = FALSE, analysis_error = NULL)
+    
+
+    observe({ req(reactive_col_types()); col_info <- reactive_col_types(); choices_y <- setNames(col_info$Column, paste0(col_info$Column, " (", col_info$DetectedType, ")")); selected_y <- isolate(input$y_var); if (!is.null(selected_y) && selected_y %in% col_info$Column) {updateSelectInput(session, "y_var", choices = c("Vyberte..." = "", choices_y), selected = selected_y)} else {updateSelectInput(session, "y_var", choices = c("Vyberte..." = "", choices_y))} })
+    output$x_var_ui_placeholder <- renderUI({ req(reactive_col_types()); col_info <- reactive_col_types(); all_cols <- col_info$Column; y_selected <- input$y_var; choices_x <- all_cols; names(choices_x) <- paste0(all_cols, " (", col_info$DetectedType, ")"); if (!is.null(y_selected) && nchar(y_selected) > 0 && y_selected %in% choices_x) {choices_x <- choices_x[choices_x != y_selected]}; current_selection <- isolate(input$x_vars); valid_current_selection <- intersect(current_selection, choices_x); checkboxGroupInput(ns("x_vars"), label = tags$label("Nezávislé proměnné (X):", class = "control-label"), choices = choices_x, selected = valid_current_selection) })
+    output$analysis_loading_ui <- renderUI({ if(rv$is_analyzing){tags$div(style="display: inline-block; margin-left: 15px;", icon("spinner", class = "fa-spin", style="color: #007bff;"))}else{NULL} })
+    observeEvent(c(input$y_var, input$x_vars, input$method, reactive_data()), { req( !is.null(input$y_var) || !is.null(input$x_vars) || !is.null(input$method) ); cat("DEBUG: Input changed, resetting results.\n"); rv$analysis_results <- NULL; rv$selected_method_info <- NULL; rv$plot_data <- NULL; rv$interpretation_context <- NULL; rv$ai_interpretation <- NULL; rv$ai_error <- NULL; rv$analysis_error <- NULL; rv$is_interpreting <- FALSE }, ignoreNULL = FALSE, ignoreInit = TRUE) # DEBUG
+    
+   
+    observeEvent(input$run_analysis, {
+      cat("\n--- run_analysis START ---\n")
+      y_selected <- input$y_var; x_selected <- input$x_vars; method_selected <- input$method
+      rv$analysis_error <- NULL; rv$analysis_results <- NULL; rv$selected_method_info <- NULL; rv$plot_data <- NULL; rv$interpretation_context <- NULL; rv$ai_interpretation <- NULL; rv$ai_error <- NULL; rv$is_interpreting <- FALSE
+      rv$is_analyzing <- TRUE; cat("DEBUG: rv$is_analyzing set to TRUE\n") 
+      if (is.null(y_selected) || nchar(y_selected) == 0) {rv$analysis_error <- "Vyberte Y."; cat("DEBUG: Input validation FAILED: No Y\n"); rv$is_analyzing <- FALSE; return()} # DEBUG
+      if (is.null(x_selected) || length(x_selected) == 0) {rv$analysis_error <- "Vyberte X."; cat("DEBUG: Input validation FAILED: No X\n"); rv$is_analyzing <- FALSE; return()} # DEBUG
+      cat("DEBUG: Input validation PASSED.\n") 
+      req(reactive_data(), cancelOutput = TRUE); req(reactive_col_types(), cancelOutput = TRUE); cat("DEBUG: Data OK\n") # DEBUG
+      data_in <- reactive_data(); col_types <- reactive_col_types(); y_col_name <- y_selected; x_col_names <- x_selected
+      
+      analysis_status <- tryCatch({
+        results <- list(); 
+        cat("DEBUG: Inside tryCatch - Prep & Model Fit...\n") 
+   
+        if (!y_col_name %in% names(data_in) || !all(x_col_names %in% names(data_in))) {stop("Vybrané sloupce neexistují v datech.")}
+        df_analysis <- data_in[, c(y_col_name, x_col_names), drop = FALSE]
+        y_type_info <- col_types %>% filter(Column == y_col_name) %>% pull(DetectedType) %>% `[`(1) %||% "Unknown"
+        df_analysis_conv <- df_analysis %>% mutate(across(all_of(x_col_names), ~suppressWarnings(as.numeric(as.character(.)))))
+        y_vector_orig <- df_analysis_conv[[y_col_name]]; y_converted <- y_vector_orig
+        if(method_selected %in% c("auto", "ols", "ridge", "lasso", "elasticnet")) { if (y_type_info != "Numeric") { y_vector_conv <- suppressWarnings(as.numeric(as.character(y_vector_orig))); if (all(is.na(y_vector_conv[!is.na(y_vector_orig)]))) {stop("Y nelze převést na numerické.")}; y_converted <- y_vector_conv; y_type_info <- "Numeric" } else { y_converted <- suppressWarnings(as.numeric(as.character(y_vector_orig))) } }
+        else if (method_selected == "logistic") { unique_y <- na.omit(y_vector_orig) %>% unique(); if (length(unique_y) == 2) { y_converted <- factor(y_vector_orig); y_type_info <- "Binary Factor" } else stop("Logistická regrese vyžaduje binární Y.") }
+        else if (method_selected == "multinomial") { unique_y <- na.omit(y_vector_orig) %>% unique(); if (length(unique_y) > 2) { y_converted <- factor(y_vector_orig); y_type_info <- "Categorical Factor" } else stop("Multinomiální regrese vyžaduje >2 kategorie Y.") }
+        df_analysis_conv[[y_col_name]] <- y_converted
+        df_analysis_complete <- na.omit(df_analysis_conv)
+        if (nrow(df_analysis_complete) < (length(x_col_names) + 2)) { stop(paste("Nedostatek kompletních pozorování:", nrow(df_analysis_complete))) }
+        y <- df_analysis_complete[[y_col_name]]; X_df <- df_analysis_complete[, x_col_names, drop = FALSE]; X_matrix <- as.matrix(X_df)
+        actual_method <- method_selected; reason <- paste("Metoda:", method_selected)
+        if (method_selected == "auto") { 
+          y_is_numeric_final <- is.numeric(y); y_is_factor_final <- is.factor(y); y_levels_final <- if(y_is_factor_final) length(levels(y)) else length(unique(y))
+          if (y_is_factor_final && y_levels_final == 2) {actual_method <- "logistic"; reason <- "Auto: Binární Y -> Logistická"}
+          else if (y_is_factor_final && y_levels_final > 2) {actual_method <- "multinomial"; reason <- "Auto: Kategorické Y -> Multinomiální"}
+          else if (y_is_numeric_final) {
+            n_samples <- nrow(X_matrix); n_features <- ncol(X_matrix)
+            if (n_features >= n_samples) {actual_method <- "ridge"; reason <- "Auto: p >= n -> Ridge"}
+            else { if (n_features > 1) { formula_vif <- as.formula(paste("y~", paste0("`", x_col_names, "`", collapse="+"))); temp_lm_data <- df_analysis_complete; temp_lm_data$y <- suppressWarnings(as.numeric(as.character(temp_lm_data[[y_col_name]]))); temp_ols_fit <- if(!all(is.na(temp_lm_data$y))) tryCatch(lm(formula_vif, data = temp_lm_data), error=function(e) NULL) else NULL; vif_values <- if (!is.null(temp_ols_fit)) tryCatch(car::vif(temp_ols_fit), error = function(e) NULL) else NULL; if (!is.null(vif_values) && any(vif_values > 5, na.rm = TRUE)) {actual_method <- "ridge"; reason <- "Auto: VIF > 5 -> Ridge"} else {actual_method <- "ols"; reason <- "Auto: Standard (VIF OK) -> OLS"}} else {actual_method <- "ols"; reason <- "Auto: Standard (1 X) -> OLS"} }
+          } else stop(paste("Auto: Neznámý typ Y:", class(y)[1]))
+          cat("DEBUG: Auto selected method:", actual_method, "\n") 
+        }
+        current_method_info <- list(method = actual_method, reason = reason)
+        fit <- NULL; cv_fit <- NULL; scatter_plot_data <- NULL; residuals_plot_data <- NULL; ref_level <- "(Referenční)"
+        y_name_bt <- paste0("`", y_col_name, "`"); x_names_bt <- paste0("`", x_col_names, "`"); formula_str <- paste(y_name_bt, "~", paste(x_names_bt, collapse = " + "))
+  
+        if (actual_method == "ols") { fit <- lm(as.formula(formula_str), data = df_analysis_complete); summary_fit <- summary(fit); coeffs <- coef(summary_fit); cis <- tryCatch(confint(fit), error = function(e) NULL); intercept_idx <- which(rownames(coeffs) == "(Intercept)"); if (length(intercept_idx) > 0) results$intercept <- coeffs[intercept_idx, 1]; var_indices <- which(rownames(coeffs) != "(Intercept)"); coef_list <- list(); for (i in var_indices) { row_name <- rownames(coeffs)[i]; clean_name <- gsub("^`|`$", "", row_name); coef_list[[clean_name]] <- list(name = clean_name, coef = coeffs[i, 1], stderr = coeffs[i, 2], t_value = coeffs[i, 3], p_value = coeffs[i, 4], ciLow = if(!is.null(cis) && row_name %in% rownames(cis)) cis[row_name, 1] else NA, ciHigh = if(!is.null(cis) && row_name %in% rownames(cis)) cis[row_name, 2] else NA) }; results$coefficients <- unname(coef_list); results$r2 <- summary_fit$r.squared; results$r2_adjusted <- summary_fit$adj.r.squared; results$rmse <- sqrt(mean(residuals(fit)^2)); results$f_statistic_info <- summary_fit$fstatistic; if(length(x_col_names) == 1) scatter_plot_data <- list(x = X_df[[1]], y_true = y, y_pred = fitted(fit)); residuals_plot_data <- list(predicted = fitted(fit), residuals = residuals(fit)) }
+        else if (actual_method %in% c("ridge", "lasso", "elasticnet")) { family_type <- "gaussian"; alpha_val <- switch(actual_method, ridge=0, lasso=1, elasticnet=0.5); cv_fit <- cv.glmnet(X_matrix, y, family = family_type, alpha = alpha_val, type.measure="mse", nfolds=min(10, nrow(X_matrix))); best_lambda <- cv_fit$lambda.min; coef_obj <- coef(cv_fit, s = best_lambda); predictions <- predict(cv_fit, newx = X_matrix, s = best_lambda, type = "response"); coef_vector <- as.vector(coef_obj); results$intercept <- coef_vector[1]; coef_names <- rownames(coef_obj)[-1]; non_zero_indices <- which(coef_vector[-1] != 0); results$coefficients <- lapply(non_zero_indices, function(i) list(name = coef_names[i], coef = coef_vector[i+1])); rss <- sum((y - predictions)^2); tss <- sum((y - mean(y))^2); results$r2 <- if(tss > 0) 1 - (rss / tss) else NA; n <- length(y); p_eff <- cv_fit$nzero[which(cv_fit$lambda == best_lambda)] %||% 0; results$r2_adjusted <- if(n - p_eff - 1 > 0 && !is.na(results$r2)) 1 - ((1 - results$r2) * (n - 1) / (n - p_eff - 1)) else NA; results$rmse <- sqrt(mean((y - predictions)^2)); if(length(x_col_names) == 1) scatter_plot_data <- list(x = X_df[[1]], y_true = y, y_pred = as.vector(predictions)); residuals_plot_data <- list(predicted = as.vector(predictions), residuals = y - as.vector(predictions)) }
+        else if (actual_method == "logistic") { fit <- glm(as.formula(formula_str), data = df_analysis_complete, family = binomial(link = "logit")); summary_fit <- summary(fit); coeffs <- coef(summary_fit); results$intercept <- coeffs["(Intercept)", 1]; var_indices <- which(rownames(coeffs) != "(Intercept)"); coef_list <- list(); for (i in var_indices) { row_name <- rownames(coeffs)[i]; clean_name <- gsub("^`|`$", "", row_name); coef_list[[clean_name]] <- list(name = clean_name, coef = coeffs[i, 1], stderr = coeffs[i, 2], z_value = coeffs[i, 3], p_value = coeffs[i, 4]) }; results$coefficients <- unname(coef_list); pred_prob <- predict(fit, type = "response"); y_levels <- levels(y); pred_class <- ifelse(pred_prob > 0.5, y_levels[2], y_levels[1]); pred_class_factor <- factor(pred_class, levels = y_levels); results$accuracy <- mean(pred_class_factor == y); residuals_plot_data <- list(predicted = predict(fit, type = "link"), residuals = residuals(fit, type = "deviance")) }
+        else if (actual_method == "multinomial") { fit <- nnet::multinom(as.formula(formula_str), data = df_analysis_complete, trace=FALSE, MaxNWts = 10000, maxit = 200); summary_fit <- summary(fit); coeffs_raw <- coef(fit); is_matrix_coef <- is.matrix(coeffs_raw); y_levels <- levels(y); ref_level <- y_levels[1]; other_levels <- y_levels[-1]; results$note_multinomial <- paste("Zobrazeny koeficienty pro třídy vs. referenční třída:", ref_level); intercepts <- if(is_matrix_coef) coeffs_raw[, "(Intercept)"] else coeffs_raw["(Intercept)"]; results$intercept_multinomial <- setNames(as.list(intercepts), other_levels); results$intercept <- intercepts[1]; coef_list <- list(); pred_names_raw <- if(is_matrix_coef) colnames(coeffs_raw)[-1] else names(coeffs_raw)[-1]; valid_pred_names <- intersect(pred_names_raw, if(is_matrix_coef) colnames(coeffs_raw) else names(coeffs_raw)); for (pred_raw in valid_pred_names) {clean_name <- gsub("^`|`$", "", pred_raw); coef_vals <- if(is_matrix_coef) coeffs_raw[, pred_raw] else coeffs_raw[pred_raw]; first_coef_val <- if(is.list(coef_vals)) coef_vals[[1]] else coef_vals[1]; coef_list[[clean_name]] <- list(name = clean_name, coef = first_coef_val)}; results$coefficients <- unname(coef_list); results$coefficients_multinomial_details <- coeffs_raw; pred_class <- predict(fit, type = "class"); pred_class_factor <- factor(pred_class, levels = y_levels); results$accuracy <- mean(pred_class_factor == y) }
+        else {stop(paste("Neznámá metoda:", actual_method))}
+
+        cat("DEBUG: Inside tryCatch - Model fitting finished.\n") 
+        
+     
+        cat("DEBUG: Inside tryCatch - Assigning results directly to rv...\n") 
+        rv$analysis_results <- results; rv$selected_method_info <- current_method_info; rv$plot_data <- list(scatter = scatter_plot_data, residuals = residuals_plot_data); rv$interpretation_context <- list(y_var = y_col_name, x_vars = x_col_names, method = actual_method, is_classification = actual_method %in% c("logistic", "multinomial"), multinom_ref_level = if(actual_method == "multinomial") ref_level else NULL); rv$analysis_error <- NULL
+        cat("DEBUG: Inside tryCatch - Reactive values assigned.\n") 
+        cat("DEBUG: Inside tryCatch - Structure of rv$analysis_results:\n"); print(str(rv$analysis_results, max.level=2)) 
+        
+        cat("DEBUG: Analysis logic completed successfully inside tryCatch.\n") 
+        return("Success")
+      }, error = function(e) {
+        cat("--- ERROR captured by tryCatch ---\n"); print(e); warning(paste("Regression error:", e$message)); 
+        rv$analysis_error <- paste("Chyba:", e$message); rv$analysis_results <- NULL; rv$selected_method_info <- NULL; rv$plot_data <- NULL; rv$interpretation_context <- NULL;
+        cat("DEBUG: rv$analysis_error set to:", rv$analysis_error, "\n"); 
+        return("Error")
+      }) 
+      
+      cat("--- tryCatch finished ---\n") 
+      cat("DEBUG: Value returned by tryCatch (analysis_status):", analysis_status, "\n") 
+      rv$is_analyzing <- FALSE; cat("DEBUG: rv$is_analyzing set to FALSE\n") 
+      if (analysis_status == "Success") { cat("DEBUG: Analysis completed successfully.\n") } else { cat("DEBUG: Analysis failed.\n") } # DEBUG
+      cat("--- run_analysis END ---\n\n") 
+    }) 
+    
+    # --- Výstup pro podmíněné zobrazení (conditionalPanel) ---
+    output$showResults <- reactive({
+      cat("DEBUG: Evaluating showResults reactive...\n") 
+      !is.null(rv$analysis_results) && is.null(rv$analysis_error)
+    })
+    outputOptions(output, 'showResults', suspendWhenHidden = FALSE)
+    
+ 
+    
+    # Chyba analýzy
+    output$analysis_error_ui <- renderUI({ if (!is.null(rv$analysis_error)) { tags$div(class = "alert alert-danger", role = "alert", tags$strong("Chyba analýzy: "), rv$analysis_error) } else {NULL} })
+    
+    # Hlavička modelu
+    output$model_summary_header_ui <- renderUI({
+      req(!is.null(rv$analysis_results) && is.null(rv$analysis_error)) 
+      cat("DEBUG: Rendering model_summary_header_ui...\n") # DEBUG
+      res <- rv$analysis_results; method_info <- rv$selected_method_info; interp_context <- rv$interpretation_context; is_classification <- isTRUE(interp_context$is_classification)
+      tagList(tags$h5("Přehled modelu"), p(tags$strong("Metoda:"), toupper(method_info$method)), if(!is.null(method_info$reason)) tags$em(method_info$reason, style="font-size: small; color: grey;"), tags$hr(), tags$h6("Metriky:"), if(is_classification) p(tags$strong("Accuracy: "), if(!is.null(res$accuracy)) scales::percent(res$accuracy, accuracy = 0.1) else "N/A") else fluidRow( column(6, p(tags$strong("R²: "), if(!is.null(res$r2)) round(res$r2, 4) else "N/A")), column(6, p(tags$strong("Adj. R²: "), if(!is.null(res$r2_adjusted)) round(res$r2_adjusted, 4) else "N/A")), column(6, p(tags$strong("RMSE: "), if(!is.null(res$rmse)) round(res$rmse, 4) else "N/A")), column(6, if(!is.null(res$f_statistic_info) && length(res$f_statistic_info)>=1) p(tags$strong("F-stat: "), round(res$f_statistic_info['value'], 2)) else NULL) ))
+    })
+    
+    # Poznámky ke koeficientům
+    output$coefficients_notes_ui <- renderUI({
+      req(!is.null(rv$analysis_results) && is.null(rv$analysis_error)) 
+      res <- rv$analysis_results
+      tagList(if(!is.null(res$note_multinomial)) tags$p(tags$em(res$note_multinomial, style="font-size: small;")), if(!is.null(res$note_regularized_classification)) tags$p(tags$em(res$note_regularized_classification, style="font-size: small;")))
+    })
+    
+    # DT tabulka koeficientů
+    output$coefficients_table_dt <- renderDT({
+      req(!is.null(rv$analysis_results) && is.null(rv$analysis_error)) 
+      cat("DEBUG: Rendering DT coefficients_table_dt...\n") # DEBUG
+      res <- rv$analysis_results; method_info <- rv$selected_method_info; interp_context <- rv$interpretation_context; is_classification <- isTRUE(interp_context$is_classification)
+      if(length(res$coefficients) == 0 && is.null(res$intercept)) { return(datatable(data.frame(Zprava="Žádné koeficienty."), rownames=FALSE, options=list(dom='t', language = list(url = '//cdn.datatables.net/plug-ins/1.10.25/i18n/Czech.json')))) }
+      coef_df <- if(length(res$coefficients) > 0) bind_rows(res$coefficients) else data.frame(name=character(), coef=numeric())
+      if (!is.null(res$intercept)) { intercept_val <- res$intercept; intercept_df <- data.frame(name = "(Intercept)", coef = intercept_val); if(nrow(coef_df) > 0) { missing_cols_in_intercept <- setdiff(names(coef_df), names(intercept_df)); for(mc in missing_cols_in_intercept) intercept_df[[mc]] <- NA; missing_cols_in_coeffs <- setdiff(names(intercept_df), names(coef_df)); for(mc in missing_cols_in_coeffs) coef_df[[mc]] <- NA; common_cols <- union(names(intercept_df), names(coef_df)); coef_df <- bind_rows(intercept_df[, common_cols, drop = FALSE], coef_df[, common_cols, drop = FALSE]) } else { coef_df <- intercept_df } }
+      cols_available <- names(coef_df); cols_to_show <- c("name", "coef"); display_names_map <- c(name = "Proměnná", coef = "Odhad")
+      if (!is_classification && "stderr" %in% cols_available) { cols_to_show <- c(cols_to_show, "stderr", "t_value", "p_value", "ciLow", "ciHigh"); display_names_map <- c(display_names_map, stderr = "Std. Chyba", t_value = "t-hodnota", p_value = "p-hodnota", ciLow = "95% CI Dolní", ciHigh = "95% CI Horní") }
+      else if (is_classification && method_info$method == "logistic" && "stderr" %in% cols_available) { cols_to_show <- c(cols_to_show, "stderr", "z_value", "p_value"); display_names_map <- c(display_names_map, stderr = "Std. Chyba", z_value = "z-hodnota", p_value = "p-hodnota") }
+      cols_final <- intersect(cols_to_show, cols_available);
+      if(length(cols_final) == 0) { return(datatable(data.frame(Chyba="Nelze zobrazit koeficienty."),rownames=FALSE, options=list(dom='t', language = list(url = '//cdn.datatables.net/plug-ins/1.10.25/i18n/Czech.json')))) }
+      display_df <- coef_df[, cols_final, drop = FALSE]; colnames(display_df) <- display_names_map[cols_final]
+      num_cols_exist <- intersect(setdiff(names(display_df), "Proměnná"), names(display_df));
+      if(length(num_cols_exist) > 0) { display_df <- display_df %>% mutate(across(all_of(num_cols_exist), ~ ifelse(is.na(as.numeric(.)), NA, format(round(as.numeric(.), 4), nsmall = 4, scientific = FALSE)))) }
+      datatable(display_df, rownames = FALSE, options = list(dom = 't', paging = FALSE, searching = FALSE, ordering=FALSE, language = list(url = '//cdn.datatables.net/plug-ins/1.10.25/i18n/Czech.json')))
+    }, server = FALSE)
+    
+    # Scatter plot
+    output$scatter_plot <- renderPlotly({
+      req(!is.null(rv$analysis_results) && is.null(rv$analysis_error)) 
+      cat("DEBUG: Rendering scatter_plot...\n") # DEBUG
+      plot_data <- rv$plot_data; interp_context <- rv$interpretation_context; is_classification <- isTRUE(interp_context$is_classification)
+      tryCatch({
+        if (length(interp_context$x_vars) == 1 && !is_classification && !is.null(plot_data$scatter)) {
+          plot_ly() %>% add_markers(x = ~plot_data$scatter$x, y = ~plot_data$scatter$y_true, name = "Skutečné", marker = list(color = 'rgba(100,100,100,0.7)', size=6)) %>% add_lines(x = ~sort(plot_data$scatter$x), y = ~plot_data$scatter$y_pred[order(plot_data$scatter$x)], name = "Predikce", line = list(color = 'red', width=2)) %>% layout(title = "Skutečné vs. Predikované", xaxis = list(title = interp_context$x_vars[1]), yaxis = list(title = interp_context$y_var), showlegend = TRUE, legend=list(orientation='h', y=1.1))
+        } else { plot_ly() %>% layout(title = "Scatter plot (jen pro 1 X, ne klasifikace)", annotations = list(text = "Není k dispozici", showarrow=FALSE)) }
+      }, error = function(e) { cat("--- ERROR during Scatter Plot rendering ---\n"); print(e); plot_ly() %>% layout(title = "Chyba při vykreslení grafu", annotations = list(text = paste("Chyba:", e$message), showarrow=FALSE)) })# DEBUG
+    })
+    
+    # Residuals plot
+    output$residuals_plot <- renderPlotly({
+      req(!is.null(rv$analysis_results) && is.null(rv$analysis_error)) 
+      cat("DEBUG: Rendering residuals_plot...\n") # DEBUG
+      plot_data <- rv$plot_data
+      tryCatch({
+        if (!is.null(plot_data$residuals)) {
+          plot_ly(x = ~plot_data$residuals$predicted, y = ~plot_data$residuals$residuals, type = 'scatter', mode = 'markers', name = 'Rezidua', marker = list(color = 'rgba(50,50,200,0.7)', size=6)) %>% layout(title = "Rezidua vs. Predikované", xaxis = list(title = "Predikovaná hodnota / Link"), yaxis = list(title = "Reziduum"), showlegend = FALSE) %>% add_lines(x=range(plot_data$residuals$predicted, na.rm=TRUE), y=c(0,0), line=list(color='grey', dash='dash'), name='Nula', inherit=FALSE)
+        } else { plot_ly() %>% layout(title = "Graf reziduí", annotations = list(text = "Není k dispozici", showarrow=FALSE)) }
+      }, error = function(e) { cat("--- ERROR during Residuals Plot rendering ---\n"); print(e); plot_ly() %>% layout(title = "Chyba při vykreslení grafu", annotations = list(text = paste("Chyba:", e$message), showarrow=FALSE)) })# DEBUG
+    })
+    
+
+    output$ai_error_ui <- renderUI({ if (!is.null(rv$ai_error)) { tags$div(class = "alert alert-warning", role = "alert", tags$strong("Chyba AI: "), rv$ai_error, actionButton(ns("run_interpretation"), "Zkusit znovu", icon = icon("sync"), class = "btn btn-warning btn-xs pull-right")) } else {NULL} })
+    output$ai_interpretation_ui <- renderUI({
+      req(!is.null(rv$analysis_results) && is.null(rv$analysis_error)) 
+      cat("DEBUG: Rendering ai_interpretation_ui...\n") # DEBUG
+      if(!rv$is_interpreting && is.null(rv$ai_interpretation) && is.null(rv$ai_error)) { actionButton(ns("run_interpretation"), "Interpretovat", icon = icon("lightbulb"), class = "btn-info") }
+      else if(rv$is_interpreting) { p(icon("spinner", class = "fa-spin"), " AI pracuje...") }
+      else if(!is.null(rv$ai_interpretation)) { wellPanel(style="background-color: #e9f5ff;", tags$b("Interpretace:"), tags$p(style="white-space: pre-wrap;", rv$ai_interpretation), actionButton(ns("reset_interpretation"), "Skrýt / Nová", icon = icon("sync"), class = "btn-link btn-sm")) }
+      else { NULL }
+    })
+    
+    # OPRAVENÝ observeEvent pro AI
+    observeEvent(input$run_interpretation, {
+      cat("\n--- run_interpretation START ---\n"); # DEBUG
+      req(rv$analysis_results, rv$interpretation_context); 
+      rv$is_interpreting <- TRUE; rv$ai_interpretation <- NULL; rv$ai_error <- NULL;
+      cat("DEBUG: AI flags set (interpreting=TRUE, results=NULL)\n"); # DEBUG
+      cat("DEBUG: Preparing payload for AI.\n"); # DEBUG
+      res <- rv$analysis_results; ctx <- rv$interpretation_context; is_classification <- isTRUE(ctx$is_classification); ref_level <- ctx$multinom_ref_level %||% "(Referenční)"
+      simple_coefficients <- list(); if(!is.null(res$coefficients) && length(res$coefficients) > 0) {simple_coefficients <- lapply(res$coefficients, function(c) {val <- if(ctx$method == "multinomial") paste0(round(c$coef,3), " (vs ", ref_level, ")") else round(c$coef, 3); list(name = c$name, value = val)})}
+      simple_intercept <- NULL; if(!is.null(res$intercept)) {simple_intercept <- if(is.numeric(res$intercept)) round(res$intercept, 3) else res$intercept; if (ctx$method == "multinomial" && !is.null(res$intercept_multinomial)) {first_int_name <- names(res$intercept_multinomial)[1] %||% "první úroveň"; simple_intercept <- paste0(round(res$intercept, 3), " (pro ", first_int_name, " vs ", ref_level, ")")}}
+      payload <- list( analysis_type = "regression", method = ctx$method, dependent_variable = ctx$y_var, independent_variables = ctx$x_vars, results_summary = list(r2 = if (!is_classification && !is.null(res$r2)) res$r2 else NULL, r2_adjusted = if (!is_classification && !is.null(res$r2_adjusted)) res$r2_adjusted else NULL, rmse = if (!is_classification && !is.null(res$rmse)) res$rmse else NULL, accuracy = if (is_classification && !is.null(res$accuracy)) res$accuracy else NULL, overfitting_detected = NULL ), coefficients = simple_coefficients, intercept = simple_intercept )
+      cat("DEBUG: AI Payload prepared:\n"); print(str(payload)); # DEBUG
+      api_key <- Sys.getenv("OPENROUTER_API_KEY", "NA");
+      if (api_key == "NA" || nchar(api_key) < 10) { cat("DEBUG: Missing API Key\n"); rv$ai_error <- "API klíč..."; rv$is_interpreting <- FALSE; cat("DEBUG: AI error set (API Key), is_interpreting=FALSE\n"); return() }# DEBUG
+      cat("DEBUG: API Key found. Preparing API call.\n"); # DEBUG
+      system_prompt <- paste(
+        "Jsi AI asistent specializující se na analýzu dat. Uživatel provedl regresní analýzu a poskytne ti její výsledky.",
+        "",
+        "Tvým úkolem je interpretovat tyto výsledky v češtině, jednoduchým a srozumitelným jazykem pro někoho, kdo nemusí být expert na statistiku.",
+        "",
+        "Zaměř se na:",
+        "1. **Celkovou kvalitu modelu:** Vysvětli, co znamenají klíčové metriky (R‑squared pro regresi, Accuracy pro klasifikaci) a jak dobře model vysvětluje data nebo predikuje výsledek.",
+        "2. **Vliv nezávislých proměnných:** Popiš, které proměnné se zdají být nejdůležitější (na základě koeficientů) a jaký mají vliv (pozitivní/negativní) na závislou proměnnou. Zmiň i intercept (průsečík), pokud má smysluplnou interpretaci v kontextu.",
+        "3. **Potenciální problémy:** Pokud byla detekována známka overfittingu, upozorni na to a stručně vysvětli, co to znamená.",
+        "4. **Použitou metodu:** Stručně zmiň použitou metodu a proč byla pravděpodobně vhodná (např. lineární regrese pro číselný výstup, logistická pro binární).",
+        "",
+        "Pravidla:",
+        "- Odpovídej v češtině.",
+        "- Buď stručný a věcný, ale srozumitelný.",
+        "- Nepoužívej příliš technický žargon, pokud to není nutné.",
+        "- Neuváděj vzorce ani kód.",
+        "- Formátuj odpověď do odstavců pro lepší čitelnost.",
+        "- Pokud některá metrika chybí (např. R‑squared u klasifikace), nekomentuj její absenci, soustřeď se na dostupné informace.",
+        "- Pokud jsou koeficienty pro multinomiální regresi, vysvětli, že reprezentují vliv na jednu z kategorií oproti referenční.",
+        sep = "\n"
+      )
+      user_prompt_parts = c(paste("Provedl jsem analýzu...", payload$method), paste("Y:", payload$dependent_variable), paste("X:", paste(payload$independent_variables, collapse=", ")), "\nKlíčové výsledky:"); # Zkráceno
+      res_sum <- payload$results_summary; if (!is.null(res_sum$r2)) user_prompt_parts <- c(user_prompt_parts, paste("- R²:", round(res_sum$r2, 3))); # atd. pro další metriky
+      if (!is.null(res_sum$accuracy)) user_prompt_parts <- c(user_prompt_parts, paste("- Accuracy:", scales::percent(res_sum$accuracy, accuracy=0.1)))
+      user_prompt_parts <- c(user_prompt_parts, "\nOdhadnuté koeficienty:"); if (!is.null(payload$intercept)) {user_prompt_parts <- c(user_prompt_parts, paste("- Intercept:", payload$intercept))}
+      if (length(payload$coefficients) > 0) {for (coef in payload$coefficients) {user_prompt_parts <- c(user_prompt_parts, paste("-", coef$name, ":", coef$value))}} else {user_prompt_parts <- c(user_prompt_parts, "(Žádné proměnné)")}
+      user_prompt_parts <- c(user_prompt_parts, "\nProsím, interpretuj tyto výsledky."); full_user_prompt <- paste(user_prompt_parts, collapse = "\n")
+      cat("DEBUG: User Prompt for AI:\n", full_user_prompt, "\n"); # DEBUG
+      
+      api_error_msg <- NULL # Inicializace pro uložení chyby z tryCatch
+      response <- tryCatch({
+        POST(url = "https://openrouter.ai/api/v1/chat/completions", add_headers(Authorization = paste("Bearer", api_key), `Content-Type` = "application/json"), body = toJSON(list(model = "deepseek/deepseek-chat-v3-0324:free", messages = list(list(role = "system", content = system_prompt), list(role = "user", content = full_user_prompt)), max_tokens = 600), auto_unbox = TRUE), encode = "json", timeout(60))
+      }, error = function(e) { cat("--- ERROR API call ---\n"); print(e); api_error_msg <<- paste("Chyba spojení s AI API:", e$message); return(NULL) }) # DEBUG + Přiřazení chyby
+      
+      cat("DEBUG: AI API call finished.\n"); # DEBUG
+      
+      isolate({ # Obalení zpracování odpovědi
+        if (!is.null(api_error_msg)) { cat("DEBUG: AI Error from tryCatch:", api_error_msg, "\n"); rv$ai_error <- api_error_msg }# DEBUG
+        else if (is.null(response)) { cat("DEBUG: API call returned NULL unexpectedly.\n"); rv$ai_error <- "Neočekávaná chyba API (NULL response)." }# DEBUG
+        else {
+          status <- status_code(response); cat("DEBUG: AI API Status:", status, "\n"); # DEBUG
+          if (status >= 300) { err_content <- httr::content(response, "text", encoding="UTF-8"); err_details <- tryCatch(fromJSON(err_content)$error$message, error=function(e) substr(err_content, 1, 200)); rv$ai_error <- paste("Chyba API (", status, "): ", err_details); cat("DEBUG: Parsed AI Error:", rv$ai_error,"\n") } # DEBUG
+          else { content <- httr::content(response, "parsed"); interpretation_text <- content$choices[[1]]$message$content
+          if (!is.null(interpretation_text) && nchar(trimws(interpretation_text)) > 0) { cat("DEBUG: AI Success\n"); rv$ai_interpretation <- trimws(interpretation_text); rv$ai_error <- NULL } # DEBUG
+          else { cat("DEBUG: AI empty response\n"); rv$ai_error <- "AI nevrátila platnou interpretaci."; rv$ai_interpretation <- NULL; print(content) } # DEBUG
+          }
+        }
+        rv$is_interpreting <- FALSE; # Vypnout spinner AŽ ZDE
+        cat("DEBUG: is_interpreting set to FALSE.\n"); # DEBUG
+      }) # Konec isolate()
+      cat("--- run_interpretation END ---\n\n") # DEBUG
+    }, ignoreInit = TRUE, ignoreNULL = TRUE) # Konec observeEvent
+    
+    observeEvent(input$reset_interpretation, { cat("DEBUG: Reset AI\n"); rv$ai_interpretation <- NULL; rv$ai_error <- NULL; rv$is_interpreting <- FALSE })# DEBUG
+    
+  }) # konec moduleServer
+}

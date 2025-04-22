@@ -1,0 +1,629 @@
+
+library(shiny)
+library(dplyr)      
+library(DT)
+library(plotly)
+library(httr)
+library(jsonlite)
+library(stats)     
+library(shinycssloaders)
+library(rlang)     
+
+
+formatPValueR <- function(pValue) {
+  if (!is.numeric(pValue) || is.na(pValue)) return('-')
+  if (pValue < 0.001) return(format(pValue, scientific = TRUE, digits = 2))
+  return(format(round(pValue, 3), nsmall = 3))
+}
+
+formatCorrR <- function(corr) {
+  if (!is.numeric(corr) || is.na(corr)) return('-')
+  return(format(round(corr, 3), nsmall = 3))
+}
+
+# Funkce pro interpretaci síly korelace
+interpret_strength_R <- function(r) {
+  if (!is.numeric(r) || is.na(r)) return("N/A")
+  abs_r <- abs(r)
+  if (abs_r >= 0.7) return("Velmi silná")
+  if (abs_r >= 0.5) return("Silná")
+  if (abs_r >= 0.3) return("Střední")
+  if (abs_r >= 0.1) return("Slabá")
+  return("Žádná/Velmi slabá")
+}
+
+# --- UI Funkce Modulu ---
+correlationUI <- function(id) {
+  ns <- NS(id)
+  
+  tagList(
+    h3("Korelační Analýza"),
+    p("Vyberte numerické proměnné (alespoň dvě), mezi kterými chcete hledat vztah, a metodu výpočtu."),
+    fluidRow(
+      # --- Vstupní část ---
+      column(4,
+             wellPanel(
+               tags$b("1. Výběr proměnných"),
+               # Dynamické checkboxy
+               uiOutput(ns("column_select_ui")),
+               tags$hr(),
+               tags$b("2. Výběr metody"),
+               selectInput(ns("method"), "Metoda korelace:",
+                           choices = c("Automaticky (doporučeno)" = "auto",
+                                       "Pearson (lineární vztah)" = "pearson",
+                                       "Spearman (monotónní vztah)" = "spearman",
+                                       "Kendall Tau (pořadová data)" = "kendall"),
+                           selected = "auto"),
+               actionButton(ns("run_analysis"), "Spustit Analýzu", icon = icon("play"), class = "btn-primary"),
+               uiOutput(ns("analysis_loading_ui")) # Indikátor načítání
+             )
+      ), # konec column 4
+      
+      # --- Výstupní část ---
+      column(8,
+             h4("Výsledky Korelační Analýzy"),
+             uiOutput(ns("analysis_error_ui")), # Chyba analýzy
+             # Podmíněné zobrazení výsledků
+             conditionalPanel(
+               condition = "output.showCorrelationResults === true",
+               ns = ns,
+               tagList(
+                 # Info o metodě
+                 wellPanel(style = "background-color: #f8f9fa;", uiOutput(ns("method_info_ui"))),
+                 # Tabulka výsledků
+                 tags$h5("Detailní výsledky párů"),
+                 DTOutput(ns("results_table_dt")) %>% withSpinner(type = 4, color="#0dc5c1"),
+                 # Vizualizace (dynamicky scatter nebo heatmaps)
+                 tags$h5("Vizualizace"),
+                 uiOutput(ns("visualization_ui")) %>% withSpinner(type = 4, color="#0dc5c1"),
+                 # AI Interpretace
+                 tags$hr(), tags$h5("AI Interpretace"),
+                 uiOutput(ns("ai_error_ui")),
+                 uiOutput(ns("ai_interpretation_ui"))
+               ) # konec tagList
+             ) # konec conditionalPanel
+      ) # konec column 8
+    ) # konec fluidRow
+  ) # konec tagList
+}
+
+
+# --- Server Funkce Modulu ---
+correlationServer <- function(id, reactive_data, reactive_col_types) {
+  
+  moduleServer(id, function(input, output, session) {
+    ns <- session$ns
+    
+    # --- Reaktivní hodnoty ---
+    rv <- reactiveValues(
+      results = NULL,             # Uloží celý výsledek analýzy (list)
+      method_info = NULL,         # Info o použité metodě
+      analysis_error = NULL,
+      is_analyzing = FALSE,
+      ai_interpretation = NULL,
+      ai_error = NULL,
+      is_interpreting = FALSE
+    )
+    
+    # --- Dynamické checkboxy pro výběr sloupců ---
+    output$column_select_ui <- renderUI({
+      req(reactive_col_types())
+      col_info <- reactive_col_types()
+      # Filtrujeme jen numerické sloupce
+      numeric_cols <- col_info$Column[col_info$DetectedType == "Numeric"]
+      if (length(numeric_cols) == 0) {
+        return(p("V datech nebyly nalezeny žádné numerické sloupce.", class="text-danger"))
+      }
+      checkboxGroupInput(ns("selected_columns"),
+                         label = "Vyberte proměnné (min. 2):",
+                         choices = setNames(numeric_cols, numeric_cols),
+                         selected = isolate(input$selected_columns) # Zachováme výběr, pokud existuje
+      )
+    })
+    
+    # --- Indikátor načítání ---
+    output$analysis_loading_ui <- renderUI({
+      if (rv$is_analyzing) { tags$div(style="display: inline-block; margin-left: 15px;", icon("spinner", class = "fa-spin", style="color: #007bff;")) } else { NULL }
+    })
+    
+    # --- Reset výsledků při změně vstupů ---
+    observeEvent(c(input$selected_columns, input$method), {
+      # Only reset if results exist OR if the method input actually changed
+      method_changed <- !identical(input$method, isolate(rv$method_info$method %||% input$method))
+      columns_changed <- !identical(sort(input$selected_columns %||% character(0)), sort(isolate(rv$results$columns %||% character(0))))
+      
+      if (!is.null(rv$results) && (method_changed || columns_changed)) {
+        cat("DEBUG CORR: Input changed (method or columns), resetting results.\n") # DEBUG
+        rv$results <- NULL
+        rv$method_info <- NULL
+        rv$analysis_error <- NULL
+        rv$ai_interpretation <- NULL
+        rv$ai_error <- NULL
+      }
+    }, ignoreNULL = FALSE, ignoreInit = TRUE) # Use ignoreNULL = FALSE
+    
+    # --- Spuštění Analýzy ---
+    observeEvent(input$run_analysis, {
+      cat("\n--- run_correlation_analysis START ---\n") # DEBUG
+      rv$analysis_error <- NULL; rv$results <- NULL; rv$method_info <- NULL; rv$ai_interpretation <- NULL; rv$ai_error <- NULL
+      rv$is_analyzing <- TRUE
+      
+      selected_cols <- input$selected_columns
+      method <- input$method
+      
+      # Validace vstupů
+      if (is.null(selected_cols) || length(selected_cols) < 2) {
+        rv$analysis_error <- "Chyba: Vyberte alespoň dvě numerické proměnné."; rv$is_analyzing <- FALSE; return()
+      }
+      cat("DEBUG CORR: Inputs OK (Columns:", paste(selected_cols, collapse=", "), "Method:", method, ")\n") # DEBUG
+      
+      req(reactive_data())
+      data_in <- reactive_data()
+      
+      # --- Výpočet v tryCatch ---
+      analysis_status <- tryCatch({
+        cat("DEBUG CORR: Inside tryCatch - Preparing data...\n") 
+        
+
+        sub_df <- data_in %>%
+          dplyr::select(all_of(selected_cols)) %>% 
+ 
+          mutate(across(everything(), ~as.numeric(as.character(.)))) %>%
+          na.omit()
+        
+        if (nrow(sub_df) < 3) { # Potřebujeme alespoň 3 páry pro smysluplnou korelaci
+          stop(paste("Nedostatek kompletních pozorování po odstranění NA (nalezeno:", nrow(sub_df), "). Minimum jsou 3."))
+        }
+        sample_size <- nrow(sub_df)
+        cat("DEBUG CORR: Data prepared. Rows:", sample_size, "\n") 
+        
+        # --- Logika pro 'auto' metodu ---
+        used_method <- method
+        reason <- ""
+        if (method == "auto") {
+          cat("DEBUG CORR: Auto method selected. Checking normality...\n") 
+          normality_results <- sapply(names(sub_df), function(col) {
+            unique_vals <- unique(na.omit(sub_df[[col]]))
+            if (length(unique_vals) >= 3 && sample_size >= 3) {
+              shapiro.test(sub_df[[col]])$p.value > 0.05
+            } else {
+              FALSE # Předpokládáme non-normalitu, pokud málo dat/hodnot
+            }
+          }, simplify = FALSE)
+          
+          all_normal <- all(unlist(normality_results))
+          used_method <- if (all_normal) "pearson" else "spearman"
+          reason <- paste0("Auto výběr: ", if (all_normal) "Všechny vybrané sloupce mají přibližně normální rozdělení (Shapiro-Wilk p > 0.05) -> Použita Pearsonova metoda." else "Alespoň jeden sloupec nemá normální rozdělení nebo má málo unikátních hodnot -> Použita Spearmanova metoda.")
+          cat("DEBUG CORR: Auto result ->", used_method, ". Reason:", reason, "\n") # DEBUG
+        }
+        current_method_info <- list(method = used_method, reason = reason) # Používáme used_method
+        
+        # --- Výpočet korelací a p-hodnot ---
+        cat("DEBUG CORR: Calculating correlations using method:", used_method, "\n") # DEBUG
+        n_cols <- ncol(sub_df)
+        col_names <- names(sub_df)
+        results_list <- list()
+        p_value_matrix <- matrix(NA, nrow = n_cols, ncol = n_cols, dimnames = list(col_names, col_names))
+        cor_matrix <- matrix(NA, nrow = n_cols, ncol = n_cols, dimnames = list(col_names, col_names))
+        
+        # Výpočet párových korelací
+        for (i in 1:(n_cols - 1)) {
+          for (j in (i + 1):n_cols) {
+            var1_name <- col_names[i]
+            var2_name <- col_names[j]
+            test_result <- tryCatch(
+              cor.test(sub_df[[var1_name]], sub_df[[var2_name]], method = used_method, exact = (used_method != "spearman")),
+              error = function(e) {
+                warning(paste("Correlation test failed for", var1_name, "vs", var2_name, ":", e$message))
+                return(NULL)
+              }
+            )
+            
+            if (!is.null(test_result)) {
+              corr_estimate <- test_result$estimate
+              # Explicitně bereme první prvek odhadu (pro případ Kendall tau nebo Spearman)
+              corr <- if (is.numeric(corr_estimate) && length(corr_estimate) >= 1) corr_estimate[[1]] else NA
+              
+              pval <- test_result$p.value
+              ci_low <- if (used_method == "pearson" && !is.null(test_result$conf.int)) test_result$conf.int[1] else NA
+              ci_high <- if (used_method == "pearson" && !is.null(test_result$conf.int)) test_result$conf.int[2] else NA
+              r_squared <- if (is.numeric(corr) && !is.na(corr)) corr^2 else NA
+              significant <- if (is.numeric(pval) && !is.na(pval)) pval < 0.05 else FALSE
+              strength <- interpret_strength_R(corr)
+              
+              pair_result <- list(
+                var1 = var1_name, var2 = var2_name, correlation = corr, pValue = pval,
+                rSquared = r_squared, ciLow = ci_low, ciHigh = ci_high,
+                strength = strength, significant = significant
+              )
+              results_list[[length(results_list) + 1]] <- pair_result
+              
+              p_value_matrix[i, j] <- pval; p_value_matrix[j, i] <- pval
+              cor_matrix[i, j] <- corr; cor_matrix[j, i] <- corr
+            } else {
+              p_value_matrix[i, j] <- NA; p_value_matrix[j, i] <- NA
+              cor_matrix[i, j] <- NA; cor_matrix[j, i] <- NA
+            }
+          }
+        }
+        diag(p_value_matrix) <- 0
+        diag(cor_matrix) <- 1
+        
+        # --- Příprava dat pro scatter plot (jen pro 2 proměnné) ---
+        scatter_data <- NULL
+        if (n_cols == 2) {
+          cat("DEBUG CORR: Preparing scatter plot data.\n") # DEBUG
+          scatter_data <- list(
+            x = sub_df[[col_names[1]]], y = sub_df[[col_names[2]]],
+            xLabel = col_names[1], yLabel = col_names[2]
+          )
+        }
+        
+        # --- Uložení výsledků do rv ---
+        cat("DEBUG CORR: Assigning results directly to rv...\n") # DEBUG
+        rv$results <- list(
+          columns = col_names, matrix = cor_matrix, pValues = p_value_matrix,
+          method = used_method, # Skutečně použitá metoda
+          reason = reason,      # Zdůvodnění 'auto' volby
+          results = results_list, # Detailní výsledky párů pro tabulku
+          scatterData = scatter_data
+        )
+        # Zobrazované info může být původní 'auto', ale zdůvodnění ukáže realitu
+        rv$method_info <- list(method = method, reason = reason) # Info pro UI
+        rv$analysis_error <- NULL
+        cat("DEBUG CORR: Reactive values assigned.\n") # DEBUG
+        
+        return("Success")
+        
+      }, error = function(e) {
+        cat("--- ERROR captured by tryCatch (Correlation) ---\n"); print(e) # DEBUG
+        # Upravené chybové hlášení
+        error_message <- paste("Chyba:", e$message)
+        # Pokus o specifičtější hlášení pro select chybu
+        if (grepl("select", e$call[[1]], fixed = TRUE) || (exists("e$call") && grepl("select", deparse(e$call), fixed = TRUE)) ){
+          error_message <- paste("Chyba při výběru sloupců (možný konflikt s jiným balíčkem, např. MASS):", e$message)
+        }
+        rv$analysis_error <- error_message
+        rv$results <- NULL; rv$method_info <- NULL
+        cat("DEBUG CORR: rv$analysis_error set to:", rv$analysis_error, "\n") # DEBUG
+        return("Error")
+      }) # konec tryCatch
+      
+      # Nastavit is_analyzing AŽ PO tryCatch
+      rv$is_analyzing <- FALSE
+      cat("DEBUG CORR: rv$is_analyzing set to FALSE. Status:", analysis_status %||% "Unknown", "\n") # DEBUG
+      cat("--- run_correlation_analysis END ---\n") # DEBUG
+    }) # konec observeEvent
+    
+    # --- Výstup pro podmíněné zobrazení ---
+    output$showCorrelationResults <- reactive({
+     
+      !is.null(rv$results) && is.null(rv$analysis_error)
+    })
+    outputOptions(output, 'showCorrelationResults', suspendWhenHidden = FALSE)
+    
+
+    output$analysis_error_ui <- renderUI({ if (!is.null(rv$analysis_error)) { tags$div(class = "alert alert-danger", role = "alert", tags$strong("Chyba analýzy: "), rv$analysis_error) } else {NULL} })
+    
+    # Info o metodě
+    output$method_info_ui <- renderUI({
+      req(!is.null(rv$results) && is.null(rv$analysis_error))
+      actual_method_used <- rv$results$method # Skutečně použitá metoda
+      tagList(
+        p(tags$strong("Použitá metoda:"), tags$span(style="font-weight:bold; color:#007bff;", toupper(actual_method_used))),
+        if (nzchar(rv$results$reason)) p(tags$em(rv$results$reason, style="font-size: small; color: grey;"))
+      )
+    })
+    
+    # Tabulka výsledků
+    output$results_table_dt <- renderDT({
+      req(!is.null(rv$results) && is.null(rv$analysis_error))
+      cat("DEBUG CORR: Rendering results_table_dt...\n") # DEBUG
+      detail_results <- rv$results$results # Seznam výsledků pro každý pár
+      
+      if (length(detail_results) == 0) {
+        return(datatable(data.frame(Zprava="Nebyly nalezeny žádné páry k zobrazení."), rownames=FALSE, options=list(dom='t', language = list(url = '//cdn.datatables.net/plug-ins/1.10.25/i18n/Czech.json'))))
+      }
+      
+
+      df_for_display <- tryCatch({
+        df_bound <- bind_rows(detail_results)
+        df_bound %>%
+          mutate(
+            correlation_f = sapply(correlation, formatCorrR),
+            pValue_f = sapply(pValue, formatPValueR),
+            rSquared_f = sapply(rSquared, formatCorrR),
+            ci_f = ifelse(is.na(ciLow) | is.na(ciHigh),
+                          "-",
+                          paste0("[", sapply(ciLow, formatCorrR), ", ", sapply(ciHigh, formatCorrR), "]")
+            ),
+            significant_icon = ifelse(significant, '<span style="color:green;" title="Statisticky významné (p < 0.05)">✔️</span>', '<span style="color:red;" title="Statisticky nevýznamné (p >= 0.05)">✖️</span>')
+          ) %>%
+
+          dplyr::select(
+            `Proměnná A` = var1,
+            `Proměnná B` = var2,
+            `Korelace (r)` = correlation_f,
+            `p-hodnota` = pValue_f,
+            `R²` = rSquared_f,
+            `95% CI` = ci_f,
+            Síla = strength,
+            `Význ.?` = significant_icon
+          )
+
+      }, error = function(e){
+        cat("--- ERROR during DT data preparation ---\n"); print(e) # DEBUG
+        # Pokud selže příprava dat pro DT, vrátíme chybovou zprávu
+        rv$analysis_error <- paste("Chyba při přípravě dat pro tabulku:", e$message) # Uložíme chybu
+        return(NULL) # Vrátíme NULL, aby se DT nezobrazilo nebo zobrazilo chybu
+      })
+      
+      # Pokud příprava dat selhala, nezobrazuj tabulku (chyba se zobrazí v analysis_error_ui)
+      req(!is.null(df_for_display))
+      
+      datatable(df_for_display,
+                rownames = FALSE,
+                escape = FALSE, # Aby se ikony zobrazily jako HTML
+                options = list(
+                  dom = 't', # Jen tabulka
+                  paging = FALSE,
+                  searching = FALSE,
+                  ordering = FALSE,
+                  language = list(url = '//cdn.datatables.net/plug-ins/1.10.25/i18n/Czech.json')
+
+                )
+      )
+    }, server = FALSE) # Konec renderDT
+    
+    # Dynamická vizualizace (Scatter nebo Heatmaps)
+    output$visualization_ui <- renderUI({
+      
+      req(!is.null(rv$results) && is.null(rv$analysis_error))
+      n_cols <- length(rv$results$columns)
+      cat("DEBUG CORR: Rendering visualization_ui. N cols:", n_cols, "\n") # DEBUG
+      
+      if (n_cols == 2) {
+        plotlyOutput(ns("scatter_plot_vis"))
+      } else if (n_cols > 2) {
+        fluidRow(
+          column(6, plotlyOutput(ns("heatmap_corr_vis"))),
+          column(6, plotlyOutput(ns("heatmap_pval_vis")))
+        )
+      } else {
+        # Toto by se nemělo stát kvůli validaci vstupu, ale pro jistotu
+        p("Vizualizace není dostupná (je potřeba alespoň 2 proměnné).")
+      }
+    })
+    
+
+    output$scatter_plot_vis <- renderPlotly({
+      req(rv$results, length(rv$results$columns) == 2, !is.null(rv$results$scatterData))
+      # Přidána kontrola na analysis_error pro jistotu
+      req(is.null(rv$analysis_error))
+      cat("DEBUG CORR: Rendering scatter_plot_vis...\n") 
+      s_data <- rv$results$scatterData
+      plot_ly(data = data.frame(x = s_data$x, y = s_data$y), x = ~x, y = ~y,
+              type = 'scatter', mode = 'markers',
+              marker = list(color = '#3b82f6', size = 6, opacity = 0.7),
+              hoverinfo = 'text', text = ~paste('(', round(x, 2), ', ', round(y, 2), ')', sep='')) %>%
+        layout(title = list(text = paste("Vztah:", s_data$xLabel, "vs", s_data$yLabel), x = 0.05), # Zarovnání titulku doleva
+               xaxis = list(title = s_data$xLabel, zeroline = FALSE),
+               yaxis = list(title = s_data$yLabel, zeroline = FALSE),
+               margin = list(l = 50, r = 20, t = 40, b = 50),
+               hovermode = 'closest',
+               paper_bgcolor = 'rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+    })
+    
+    # Render Heatmap Korelací
+    output$heatmap_corr_vis <- renderPlotly({
+      req(rv$results, length(rv$results$columns) > 2, !is.null(rv$results$matrix))
+      req(is.null(rv$analysis_error))
+      cat("DEBUG CORR: Rendering heatmap_corr_vis...\n") # DEBUG
+      plot_ly(z = rv$results$matrix, x = rv$results$columns, y = rv$results$columns,
+              type = 'heatmap', colorscale = 'RdBu', zmin = -1, zmax = 1, zmid = 0,
+              xgap=1, ygap=1, hoverongaps = FALSE,
+              # Zobrazení hodnot v buňkách heat mapy
+              text = round(rv$results$matrix, 2), texttemplate = "%{text}",
+              hoverinfo = 'x+y+z',
+              colorbar = list(title = 'Korelace (r)', len=0.75)) %>%
+        layout(title = 'Korelační matice (r)',
+               xaxis = list(tickangle = -45, automargin=TRUE),
+               yaxis = list(automargin=TRUE),
+               margin = list(l = 100, r = 20, t = 40, b = 100),
+               paper_bgcolor = 'rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+    })
+    
+    # Render Heatmap P-hodnot
+    output$heatmap_pval_vis <- renderPlotly({
+      req(rv$results, length(rv$results$columns) > 2, !is.null(rv$results$pValues))
+      req(is.null(rv$analysis_error))
+      cat("DEBUG CORR: Rendering heatmap_pval_vis...\n") # DEBUG
+      # Vlastní barevná škála pro p-hodnoty
+      colorscale_pval <- list(c(0, 'rgb(0,100,0)'),      # p=0 (tmavě zelená)
+                              list(0.0499, 'rgb(0,100,0)'), # těsně pod 0.05 (tmavě zelená)
+                              list(0.05, 'rgb(255,140,0)'), # p=0.05 (oranžová)
+                              list(1, 'rgb(220,220,220)')) # p=1 (světle šedá)
+      
+      pvals_off_diag <- rv$results$pValues[lower.tri(rv$results$pValues) | upper.tri(rv$results$pValues)]
+      max_pval_for_scale <- max(c(0.1, pvals_off_diag), na.rm = TRUE)
+      if(all(is.na(pvals_off_diag) | pvals_off_diag >= 0.1)) max_pval_for_scale <- 1
+      
+      # Zobrazení p-hodnot v buňkách, formátované
+      p_text_matrix <- matrix("", nrow=nrow(rv$results$pValues), ncol=ncol(rv$results$pValues))
+      for(r in 1:nrow(p_text_matrix)){
+        for(c in 1:ncol(p_text_matrix)){
+          if(r!=c) p_text_matrix[r,c] <- formatPValueR(rv$results$pValues[r,c])
+        }
+      }
+      
+      plot_ly(z = rv$results$pValues, x = rv$results$columns, y = rv$results$columns,
+              type = 'heatmap', colorscale = colorscale_pval, zmin=0, zmax=max_pval_for_scale,
+              xgap=1, ygap=1, hoverongaps = FALSE,
+              # Zobrazení formátovaných p-hodnot
+              text = p_text_matrix, texttemplate = "%{text}",
+              hoverinfo = 'x+y+z', # Zobrazí neformátovanou p-hodnotu při hoveru
+              colorbar = list(title = 'p-hodnota', len=0.75,
+                              tickvals= c(0, 0.01, 0.05, max_pval_for_scale),
+                              ticktext= c("0", "0.01", "0.05", format(round(max_pval_for_scale,2), nsmall=2))
+              )) %>%
+        layout(title = 'p-hodnoty (významnost)',
+               xaxis = list(tickangle = -45, automargin=TRUE),
+               yaxis = list(automargin=TRUE),
+               margin = list(l = 100, r = 20, t = 40, b = 100),
+               paper_bgcolor = 'rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+    })
+    
+    
+    # --- AI Interpretace ---
+    output$ai_error_ui <- renderUI({ if (!is.null(rv$ai_error)) { tags$div(class = "alert alert-warning", role = "alert", tags$strong("Chyba AI: "), rv$ai_error, actionButton(ns("run_interpretation"), "Zkusit znovu", icon = icon("sync"), class = "btn btn-warning btn-xs pull-right")) } else {NULL} })
+    output$ai_interpretation_ui <- renderUI({
+     
+      req(!is.null(rv$results) && is.null(rv$analysis_error))
+      # cat("DEBUG CORR: Rendering ai_interpretation_ui...\n") 
+      if(!rv$is_interpreting && is.null(rv$ai_interpretation) && is.null(rv$ai_error)) { actionButton(ns("run_interpretation"), "Interpretovat pomocí AI", icon = icon("lightbulb"), class = "btn-info") }
+      else if(rv$is_interpreting) { p(icon("spinner", class = "fa-spin"), " AI pracuje...") }
+      else if(!is.null(rv$ai_interpretation)) { wellPanel(style="background-color: #e9f5ff;", tags$b("AI Interpretace:"), tags$p(style="white-space: pre-wrap;", rv$ai_interpretation), actionButton(ns("reset_interpretation"), "Skrýt / Nová", icon = icon("sync"), class = "btn-link btn-sm")) }
+      else { NULL } # Zobrazí se jen pokud je chyba AI (handled by ai_error_ui)
+    })
+    
+
+    observeEvent(input$run_interpretation, {
+      cat("\n--- run_correlation_interpretation START ---\n"); 
+      req(rv$results); # Potřebujeme výsledky
+      # Přidána kontrola, že nebyla chyba v základní analýze
+      req(is.null(rv$analysis_error))
+      rv$is_interpreting <- TRUE; rv$ai_interpretation <- NULL; rv$ai_error <- NULL;
+      cat("DEBUG CORR: AI flags set (interpreting=TRUE, results=NULL)\n"); # DEBUG
+      
+      # --- Příprava Payload pro AI ---
+      cat("DEBUG CORR: Preparing payload for AI.\n"); 
+      payload <- list(
+        analysis_type = "correlation",
+        method = rv$results$method,
+        variables = rv$results$columns,
+        correlation_pairs = lapply(rv$results$results, function(p) {
+          list(var1 = p$var1,
+               var2 = p$var2,
+               correlation = if(is.numeric(p$correlation) && !is.na(p$correlation)) round(p$correlation, 3) else p$correlation,
+               pValue = if(is.numeric(p$pValue) && !is.na(p$pValue)) round(p$pValue, 5) else p$pValue,
+               significant = p$significant,
+               strength = p$strength)
+        }),
+        visualization_type = if (length(rv$results$columns) == 2) "scatterplot" else "matrix"
+      )
+      # cat("DEBUG CORR: AI Payload prepared:\n"); print(str(payload, max.level=2)); # DEBUG
+      
+      # --- API Klíč a Volání ---
+      api_key <- Sys.getenv("OPENROUTER_API_KEY", NA_character_);
+      if (is.na(api_key) || nchar(api_key) < 10) { cat("DEBUG CORR: Missing API Key\n"); rv$ai_error <- "API klíč (OPENROUTER_API_KEY) není nastaven nebo je neplatný."; rv$is_interpreting <- FALSE; cat("DEBUG CORR: AI error set (API Key), is_interpreting=FALSE\n"); return() }# DEBUG
+      cat("DEBUG CORR: API Key found. Preparing API call.\n"); # DEBUG
+      
+   
+      system_prompt <- paste(
+        "Jsi AI asistent specializující se na analýzu dat. Uživatel provedl korelační analýzu a poskytne ti její výsledky.",
+        "",
+        "Tvým úkolem je interpretovat tyto výsledky v češtině, jednoduchým a srozumitelným jazykem pro někoho, kdo nemusí být expert na statistiku.",
+        "",
+        "Zaměř se na:",
+        "1. **Použitou metodu:** Stručně zmiň použitou metodu ({payload$method}) a proč byla pravděpodobně vhodná (Pearson pro lineární vztahy a normální data, Spearman pro monotónní vztahy nebo neparametrická data, Kendall pro pořadová data).",
+        "2. **Významné vztahy:** Pro každý statisticky významný pár (significant = true, p < 0.05):",
+        "   - Uveď obě proměnné.",
+        "   - Popiš sílu a směr vztahu (např. 'silná pozitivní korelace', 'střední negativní korelace') na základě hodnoty korelačního koeficientu (r) a kategorie 'strength'.",
+        "   - Stručně vysvětli, co tento vztah znamená v kontextu dat (např. 'Když roste hodnota X, má tendenci růst i hodnota Y').",
+        "3. **Nevýznamné vztahy:** Pokud existují páry, kde vztah není statisticky významný (significant = false, p >= 0.05), zmiň to souhrnně (např. 'Mezi ostatními páry nebyl nalezen statisticky významný vztah'). Pokud jsou *všechny* nevýznamné, zdůrazni to.",
+        "4. **Celkové shrnutí:** Poskytni krátké celkové zhodnocení, které proměnné se zdají být nejvíce/nejméně provázané.",
+        "5. **Důležité upozornění:** Vždy zdůrazni, že **korelace neznamená kauzalitu**. To, že jsou dvě proměnné ve vztahu, neznamená, že jedna způsobuje druhou.",
+        "",
+        "Pravidla:",
+        "- Odpovídej v češtině.",
+        "- Buď stručný a věcný, ale srozumitelný.",
+        "- Nepoužívej příliš technický žargon, pokud to není nutné.",
+        "- Neuváděj vzorce ani kód.",
+        "- Formátuj odpověď do odstavců pro lepší čitelnost.",
+        "- Pokud nebyly nalezeny žádné významné vztahy, jasně to konstatuj.",
+        sep = "\n"
+      )
+   
+      user_prompt_parts <- list(
+        paste0("Provedl jsem korelační analýzu ('", payload$analysis_type, "') metodou '", payload$method, "' pro proměnné: ", paste(payload$variables, collapse=', '), "."),
+        paste0("Vizualizace byla typu: ", if(payload$visualization_type == 'matrix') 'maticová (více proměnných)' else 'bodový graf (dvě proměnné)', ".")
+      )
+      significant_pairs <- Filter(function(p) isTRUE(p$significant), payload$correlation_pairs)
+      non_significant_pairs <- Filter(function(p) !isTRUE(p$significant), payload$correlation_pairs)
+      
+      if (length(significant_pairs) > 0) {
+        user_prompt_parts[[length(user_prompt_parts) + 1]] <- "\nStatisticky významné vztahy (p < 0.05):"
+        for (pair in significant_pairs) {
+          pval_formatted <- if(is.numeric(pair$pValue)) formatPValueR(pair$pValue) else as.character(pair$pValue) # Použij formátovací funkci
+          corr_formatted <- if(is.numeric(pair$correlation)) formatCorrR(pair$correlation) else as.character(pair$correlation) # Použij formátovací funkci
+          user_prompt_parts[[length(user_prompt_parts) + 1]] <- sprintf("- %s a %s: Korelace r=%s (Síla: %s), p=%s", pair$var1, pair$var2, corr_formatted, pair$strength, pval_formatted)
+        }
+      } else {
+        user_prompt_parts[[length(user_prompt_parts) + 1]] <- "\nNebyly nalezeny žádné statisticky významné vztahy (p < 0.05)."
+      }
+      
+      if (length(non_significant_pairs) > 0 && length(significant_pairs) < length(payload$correlation_pairs)) {
+        user_prompt_parts[[length(user_prompt_parts) + 1]] <- sprintf("\nMezi %d dalšími páry nebyl nalezen statisticky významný vztah (p >= 0.05).", length(non_significant_pairs))
+      } else if (length(non_significant_pairs) == length(payload$correlation_pairs) && length(non_significant_pairs) > 0) {
+        # Případ, kdy jsou VŠECHNY nevýznamné (už bylo řečeno, že žádné významné nejsou)
+        user_prompt_parts[[length(user_prompt_parts) + 1]] <- sprintf("\nCelkem bylo testováno %d párů proměnných.", length(non_significant_pairs))
+      }
+      
+      user_prompt_parts[[length(user_prompt_parts) + 1]] <- "\nProsím, interpretuj tyto výsledky."
+      full_user_prompt <- paste(user_prompt_parts, collapse = "\n")
+      
+      # cat("DEBUG CORR: User Prompt for AI:\n", full_user_prompt, "\n");
+      
+      api_error_msg <- NULL
+      response <- tryCatch({
+        POST(url = "https://openrouter.ai/api/v1/chat/completions",
+             add_headers(Authorization = paste("Bearer", api_key), `Content-Type` = "application/json"),
+             body = toJSON(list(model = "deepseek/deepseek-chat-v3-0324:free", # Spolehlivý model
+                                messages = list(list(role = "system", content = system_prompt),
+                                                list(role = "user", content = full_user_prompt)),
+                                max_tokens = 800
+             ), auto_unbox = TRUE),
+             encode = "json",
+             timeout(60)) 
+      }, error = function(e) { cat("--- ERROR API call ---\n"); print(e); api_error_msg <<- paste("Chyba spojení s AI API:", e$message); return(NULL) }) # DEBUG
+      
+      cat("DEBUG CORR: AI API call finished.\n"); 
+      
+      isolate({ 
+        if (!is.null(api_error_msg)) {
+          cat("DEBUG CORR: AI Error from tryCatch:", api_error_msg, "\n"); rv$ai_error <- api_error_msg
+        } else if (is.null(response)) {
+          cat("DEBUG CORR: API call returned NULL unexpectedly.\n"); rv$ai_error <- "Neočekávaná chyba API (NULL response)."
+        } else {
+          status <- status_code(response); cat("DEBUG CORR: AI API Status:", status, "\n");
+          if (status >= 300) {
+            err_content <- httr::content(response, "text", encoding="UTF-8")
+            err_details <- tryCatch(fromJSON(err_content)$error$message, error=function(e) substr(err_content, 1, 300)) %||% "Neznámý detail chyby."
+            rv$ai_error <- paste("Chyba AI API (", status, "): ", err_details)
+            cat("DEBUG CORR: Parsed AI Error:", rv$ai_error,"\n")
+            # cat("DEBUG CORR: Full error response content:\n", err_content, "\n") 
+          } else {
+            content <- httr::content(response, "parsed")
+            interpretation_text <- content$choices[[1]]$message$content %||% "" 
+            if (nchar(trimws(interpretation_text)) > 0) {
+              cat("DEBUG CORR: AI Success\n")
+              rv$ai_interpretation <- trimws(interpretation_text)
+              rv$ai_error <- NULL
+            } else {
+              cat("DEBUG CORR: AI empty or invalid response\n")
+              rv$ai_error <- "AI nevrátila platnou interpretaci (prázdná odpověď)."
+              rv$ai_interpretation <- NULL
+              # cat("DEBUG CORR: Received content:\n"); print(content) 
+            }
+          }
+        }
+        rv$is_interpreting <- FALSE; 
+        cat("DEBUG CORR: is_interpreting set to FALSE.\n"); 
+      }) 
+      cat("--- run_correlation_interpretation END ---\n\n") 
+    }, ignoreInit = TRUE, ignoreNULL = TRUE) 
+    
+    observeEvent(input$reset_interpretation, { cat("DEBUG CORR: Reset AI\n"); rv$ai_interpretation <- NULL; rv$ai_error <- NULL; rv$is_interpreting <- FALSE })# DEBUG
+    
+  }) # konec moduleServer
+}

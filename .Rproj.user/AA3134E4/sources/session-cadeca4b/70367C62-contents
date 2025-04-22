@@ -1,0 +1,345 @@
+# --- Načtení všech potřebných knihoven ---
+library(shiny)
+library(shinythemes)
+library(DT)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(stats)
+library(MASS)
+library(nortest)
+library(car)
+library(httr)
+library(jsonlite)
+library(glmnet)
+library(shinycssloaders)
+library(nnet)
+library(rlang)
+library(scales)
+
+# --- Načtení modulů ---
+source("R/module_input_col_missing.R")
+source("R/module_outliers.R")
+source("R/module_normality.R")
+source("R/module_hub.R")
+source("R/module_regression.R")
+source("R/module_correlation.R")
+source("R/module_dependency.R")
+source("R/module_classification.R")
+
+# --- Hlavní UI ---
+ui <- fluidPage(
+  theme = shinytheme("cerulean"),
+  titlePanel("Interaktivní Nástroj pro Analýzu Dat"),
+  
+  tabsetPanel(
+    id = "mainAnalysisTabs",
+    
+    # --- Záložka 1: Příprava Dat ---
+    tabPanel(
+      title = "1. Příprava Dat",
+      value = "dataPrepTab",
+      inputColMissingUI(id = "data_module"),
+      hr(),
+      actionButton("continue_to_outliers_btn", "Pokračovat k Odlehlým Hodnotám",
+                   icon("arrow-right"), class = "btn-info", style="margin-top: 15px;")
+    ),
+    
+    # --- Záložka 2: Odlehlé Hodnoty ---
+    tabPanel(
+      title = "2. Odlehlé Hodnoty",
+      value = "outlierAnalysisTab",
+      outliersUI(id = "outlier_module"),
+      hr(),
+      actionButton("continue_to_normality_btn", "Pokračovat k Normalitě",
+                   icon("arrow-right"), class = "btn-success", style="margin-top: 15px;")
+    ),
+    
+    # --- Záložka 3: Normalita ---
+    tabPanel(
+      title = "3. Normalita",
+      value = "normalityTestTab",
+      normalityUI(id = "normality_module"),
+      hr(),
+      actionButton("continue_to_hub_btn", "Pokračovat k Výběru Analýzy",
+                   icon("arrow-right"), class = "btn-primary", style="margin-top: 15px;")
+    ),
+    
+    # --- Záložka 4: Rozcestník Analýz (Hub) ---
+    tabPanel(
+      title = "4. Výběr Analýzy",
+      value = "analysisHubTab",
+      analysisHubUI(id = "hub_module")
+    ),
+    
+    # --- Záložky pro Konkrétní Analýzy ---
+    tabPanel(
+      title = "A: Porovnání Skupin",
+      value = "comparisonTab",
+      comparisonUI(id = "comparison_analysis")
+    ),
+    tabPanel(
+      title = "A: Korelace",
+      value = "correlationTab",
+      correlationUI(id = "correlation_analysis")
+    ),
+    tabPanel(
+      title = "A: Regrese",
+      value = "regressionTab",
+      regressionUI(id = "regression_module")
+    ),
+    tabPanel(
+      title = "A: Test Závislosti",
+      value = "dependencyTab",
+      dependencyTestUI(id = "dependency_analysis")
+    )
+  ) # Konec tabsetPanel
+) # Konec fluidPage
+
+
+# --- Hlavní Server ---
+server <- function(input, output, session) {
+  
+  # --- Centrální reaktivní hodnoty aplikace ---
+  rv <- reactiveValues(
+    raw_data = NULL,
+    data_prepared = NULL,       # Data po modulu 1 (vstup, typy, chybějící)
+    col_types = NULL,
+    data_after_outliers = NULL, # Data vstupující do modulu 3 (normalita) - buď = data_prepared nebo po handlingu
+    outlier_summary = NULL,     # Shrnutí z modulu 2
+    normality_results = NULL,
+    data_transformed = NULL,    # Data vstupující do modulu 4 (hub) a analýz - buď = data_after_outliers nebo po transformaci
+    outlier_step_visited = FALSE
+  )
+  
+  # --- Volání serveru modulu 1: Příprava Dat ---
+  data_module_output <- inputColMissingServer(id = "data_module")
+  
+  # --- Reakce na změny dat a typů z modulu 1 ---
+  observeEvent(data_module_output$data(), {
+    print("Hlavní App: Detekována změna dat z modulu 1 (Příprava).")
+    new_data <- data_module_output$data()
+    if (!is.null(new_data) && is.data.frame(new_data) && nrow(new_data) > 0) {
+      rv$data_prepared <- new_data
+      # Reset všech následujících kroků
+      rv$data_after_outliers <- NULL
+      rv$data_transformed <- NULL
+      rv$outlier_summary <- NULL
+      rv$normality_results <- NULL
+      rv$outlier_step_visited <- FALSE
+      print("Hlavní App: Stavy dat po přípravě resetovány.")
+    } else {
+      # Pokud modul 1 vrátí NULL, reset vše
+      rv$data_prepared <- NULL
+      rv$col_types <- NULL
+      rv$data_after_outliers <- NULL
+      rv$data_transformed <- NULL
+      rv$outlier_summary <- NULL
+      rv$normality_results <- NULL
+      rv$outlier_step_visited <- FALSE
+      print("Hlavní App: Modul 1 vrátil NULL data nebo data jsou prázdná. Všechny stavy resetovány.")
+    }
+  }, ignoreNULL = FALSE)
+  
+  observeEvent(data_module_output$col_types(), {
+    print("Hlavní App: Detekována změna typů sloupců z modulu 1.");
+    rv$col_types <- data_module_output$col_types()
+  }, ignoreNULL = TRUE) 
+  
+  # --- Logika pro tlačítko "Pokračovat k Odlehlým Hodnotám" ---
+  observeEvent(input$continue_to_outliers_btn, {
+    req(rv$data_prepared)
+    missing_values_present <- any(sapply(rv$data_prepared, function(x) any(is.na(x))))
+    if (missing_values_present) {
+      showNotification("Chyba: V datech jsou stále chybějící hodnoty.", type = "error", duration = 10)
+    } else {
+      print("Hlavní App: Přepínám na záložku Odlehlé Hodnoty...")
+
+      rv$data_after_outliers <- rv$data_prepared
+   
+      rv$data_transformed <- rv$data_prepared
+  
+      rv$outlier_step_visited <- TRUE
+      updateTabsetPanel(session, "mainAnalysisTabs", selected = "outlierAnalysisTab")
+    }
+  })
+  
+  # --- Volání serveru modulu 2: Odlehlé Hodnoty ---
+  # Předáváme data po přípravě 
+  outlier_module_output <- outliersServer(
+    id = "outlier_module",
+    reactive_data = reactive({ req(rv$data_prepared); rv$data_prepared }), 
+    reactive_col_types = reactive({ rv$col_types })
+  )
+  
+  # --- Aktualizace dat PO ZPRACOVÁNÍ outlierů ---
+  observeEvent(outlier_module_output$handled_data(), {
+    print("Hlavní App: Sleduji ZMĚNU v handled_data z modulu outlierů.")
+    modified_data <- outlier_module_output$handled_data()
+    
+    # --- Aktualizovat pouze pokud přišla non-NULL data ---
+    if (!is.null(modified_data) && is.data.frame(modified_data)) {
+      print("Hlavní App: Přijata platná UPRAVENÁ data po zpracování outlierů z modulu 2.")
+
+      rv$data_after_outliers <- modified_data
+      rv$data_transformed <- modified_data
+      print("Hlavní App: rv$data_after_outliers a rv$data_transformed aktualizovány na data PO handlingu.")
+    } else {
+      # Pokud modul vrátil NULL (např. po resetu uvnitř modulu nebo chyba), neaktualizujeme
+      # rv$data_after_outliers už bylo nastaveno na rv$data_prepared při přechodu na tab
+      print("Hlavní App: Modul outlierů vrátil NULL pro handled_data. rv$data_after_outliers zůstává nezměněno (mělo by být = data po přípravě).")
+    }
+    # --- KONEC ZMĚNY ---
+  }, ignoreNULL = FALSE, ignoreInit = TRUE) # ignoreNULL=FALSE je důležité, aby se NULL signál zpracoval
+  
+  # --- Uložení shrnutí outlierů ---
+  # Toto zůstává stejné, jen ukládáme poslední platné summary
+  observeEvent(outlier_module_output$summary(), {
+    print("Hlavní App: Sleduji ZMĚNU v summary z modulu outlierů.")
+    current_summary <- outlier_module_output$summary()
+    if (!is.null(current_summary) && is.data.frame(current_summary) && !"Zprava" %in% names(current_summary)) { # Akceptujeme i prázdný frame
+      rv$outlier_summary <- current_summary
+      print("Hlavní App: Platné outlier_summary uloženo/aktualizováno.")
+    } else {
+      if (!is.null(rv$outlier_summary)) { # Resetovat jen pokud tam něco bylo
+        rv$outlier_summary <- NULL
+        print("Hlavní App: Resetuji rv$outlier_summary na NULL (přišla zpráva nebo NULL).")
+      }
+    }
+  }, ignoreNULL = FALSE, ignoreInit = TRUE) # ignoreNULL=FALSE
+  
+  # --- Logika pro tlačítko "Pokračovat k Normalitě" ---
+  observeEvent(input$continue_to_normality_btn, {
+    # Nyní by req(rv$data_after_outliers) mělo fungovat, protože se inicializovalo při přechodu na tab
+    req(rv$data_after_outliers, rv$outlier_step_visited)
+    print("Hlavní App: Přepínám na záložku Normalita...")
+    # Zkontrolujeme, zda se data pro transformaci liší od dat po outlierech
+    # (měla by být stejná, pokud nedošlo k transformaci)
+    if(!identical(rv$data_transformed, rv$data_after_outliers)) {
+      rv$data_transformed <- rv$data_after_outliers # Synchronizujeme, pokud se liší (nemělo by se stát zde)
+      print("Hlavní App: Synchronizuji data_transformed s data_after_outliers.")
+    }
+    updateTabsetPanel(session, "mainAnalysisTabs", selected = "normalityTestTab")
+  })
+  
+  # --- Volání serveru modulu 3: Normalita ---
+  # Předáváme data po kroku outlierů (data_after_outliers)
+  normality_module_output <- normalityServer(
+    id = "normality_module",
+    reactive_data = reactive({ req(rv$data_after_outliers); rv$data_after_outliers }), # <--- ZMĚNA VSTUPU
+    reactive_col_types = reactive({ rv$col_types })
+  )
+  
+  # --- Uložení výsledků testů normality ---
+  observeEvent(normality_module_output$results(), {
+    # ... (stejný kód jako předtím) ...
+    new_results <- normality_module_output$results(); if (!is.null(new_results) && is.data.frame(new_results) && nrow(new_results) > 0) { rv$normality_results <- new_results; print("Hlavní App: Přijaty nové platné výsledky normality.") }
+    else { rv$normality_results <- NULL; print("Hlavní App: Modul normality vrátil NULL nebo neplatné výsledky.") }
+  }, ignoreNULL = FALSE, ignoreInit = TRUE)
+  
+  # --- Obsluha požadavku na transformaci z modulu normality ---
+  # Důležité: Transformace se aplikuje na rv$data_transformed
+  observeEvent(normality_module_output$transform_request(), {
+    req(rv$data_transformed); # Pracujeme s daty určenými pro analýzy
+    request <- normality_module_output$transform_request(); req(request);
+    col_name <- request$column; method <- request$method
+    print(paste("Hlavní App: Požadavek na transformaci sloupce", shQuote(col_name), "metodou", method))
+    
+    if (!col_name %in% names(rv$data_transformed)) {
+      showNotification(paste("Chyba transformace: Sloupec", shQuote(col_name), "nenalezen v datech pro transformaci."), type = "error"); return()
+    }
+    
+    # Získání dat z rv$data_transformed
+    target_col_data <- rv$data_transformed[[col_name]]
+    
+    # ... (zbytek logiky transformace zůstává stejný, pracuje s target_col_data) ...
+    if (!is.numeric(target_col_data)) { target_col_data_num <- suppressWarnings(as.numeric(as.character(target_col_data))); if(all(is.na(target_col_data_num[!is.na(target_col_data)]))) { showNotification(paste("Chyba transformace: Sloupec", shQuote(col_name), "není numerický."), type = "error"); return() }; temp_data <- rv$data_transformed; temp_data[[col_name]] <- target_col_data_num; rv$data_transformed <- temp_data; target_col_data <- target_col_data_num }
+    original_column_data <- target_col_data; transformed_column_data <- original_column_data; success <- FALSE; error_msg <- NULL
+    tryCatch({
+      data_to_transform <- original_column_data
+      if (method == "log") { min_val <- min(data_to_transform, na.rm = TRUE); if(is.na(min_val)) stop("NA only."); if (min_val >= 0) transformed_column_data <- log(data_to_transform + 1) else { shift <- abs(min_val) + 1e-6; transformed_column_data <- log(data_to_transform + shift) } }
+      else if (method == "sqrt") { min_val <- min(data_to_transform, na.rm = TRUE); if(is.na(min_val)) stop("NA only."); if (min_val < 0) stop("Nelze použít odmocninu na záporné hodnoty."); transformed_column_data <- sqrt(data_to_transform) }
+      else if (method == "boxcox") { positive_data <- data_to_transform[data_to_transform > 0 & !is.na(data_to_transform)]; if (length(positive_data) < 3 || length(unique(positive_data)) < 2) stop("Nedostatek kladných unikátních hodnot pro Box-Cox."); lambda <- NA_real_; tryCatch({ bc_fit <- MASS::boxcox(positive_data ~ 1, plotit = FALSE, lambda = seq(-3, 3, length.out = 100)); lambda <- bc_fit$x[which.max(bc_fit$y)] }, error = function(e_bc) stop(paste("Výpočet Box-Cox lambda selhal:", e_bc$message))); if (is.na(lambda)) stop("Nepodařilo se určit lambda."); transformed_column_data <- ifelse(!is.na(data_to_transform) & data_to_transform > 0, if (abs(lambda) < 1e-6) log(data_to_transform) else (data_to_transform^lambda - 1) / lambda, data_to_transform); if(sum(data_to_transform <= 0, na.rm = TRUE) > 0) showNotification("Box-Cox aplikován jen na kladné hodnoty.", type="warning") }
+      else stop(paste("Neznámá metoda:", method))
+      if (all(is.na(transformed_column_data[!is.na(original_column_data)]))) stop("Transformace vedla k samým NA."); valid_transformed <- transformed_column_data[!is.na(transformed_column_data)]; if (length(unique(valid_transformed)) < 2 && length(valid_transformed) > 0) stop("Transformace vedla ke konstantní hodnotě."); success <- TRUE
+    }, error = function(e) error_msg <<- e$message)
+    
+    
+    if (success) {
+      # <<< ZMĚNA: Aktualizujeme rv$data_transformed >>>
+      current_data <- rv$data_transformed
+      current_data[[col_name]] <- transformed_column_data
+      rv$data_transformed <- current_data
+      # <<< KONEC ZMĚNY >>>
+      showNotification(paste("Sloupec", shQuote(col_name), "transformován:", method), type = "message")
+    } else {
+      showNotification(paste("Transformace sloupce", shQuote(col_name), "selhala:", error_msg), type = "error", duration = 8)
+    }
+  }, ignoreNULL = TRUE, ignoreInit = TRUE)
+  
+  # --- Logika pro tlačítko "Pokračovat k Výběru Analýzy" ---
+  observeEvent(input$continue_to_hub_btn, {
+    # Nyní požadujeme rv$data_transformed
+    req(rv$data_transformed)
+    na_check <- sapply(rv$data_transformed, function(x) any(is.na(x)))
+    if (any(na_check)) {
+      cols_with_na <- names(na_check)[na_check]
+      showNotification(paste("Varování: NA v datech určených pro analýzu (sloupce:", paste(cols_with_na, collapse=", "), "). Některé analýzy nemusí fungovat správně."), type="warning", duration=10)
+    }
+    print("Hlavní App: Přepínám na záložku Výběr Analýzy (Hub)...")
+    updateTabsetPanel(session, "mainAnalysisTabs", selected = "analysisHubTab")
+  })
+  
+  # --- Volání serveru modulu 4: Analysis Hub ---
+  # Předáváme data po normalitě/transformaci (data_transformed)
+  hub_output <- analysisHubServer(
+    id = "hub_module",
+    reactive_prepared_data = reactive({ req(rv$data_transformed); rv$data_transformed }), # <--- ZMĚNA VSTUPU
+    reactive_col_types = reactive({ rv$col_types })
+  )
+  
+  # --- Logika pro navigaci z Hubu do konkrétní analýzy ---
+  observeEvent(hub_output$proceed_event(), {
+    # ... (stejný kód jako předtím) ...
+    req(hub_output$proceed_event() > 0); selected_analysis_key <- hub_output$selected_analysis(); req(selected_analysis_key, nchar(selected_analysis_key) > 0)
+    target_tab <- switch(selected_analysis_key, "comparison" = "comparisonTab", "correlation" = "correlationTab", "regression" = "regressionTab", "dependency" = "dependencyTab", NULL)
+    if (!is.null(target_tab)) { print(paste("Hlavní App: Přepínám na záložku:", target_tab)); updateTabsetPanel(session, "mainAnalysisTabs", selected = target_tab) }
+    else { print(paste("Chyba: Neznámý klíč analýzy z Hubu:", selected_analysis_key)); showNotification("Chyba: Nelze přejít na neznámý typ analýzy.", type="error") }
+  }, ignoreNULL = TRUE, ignoreInit = TRUE)
+  
+  
+  # --- Kontrola manuálního přepínání záložek ---
+  observeEvent(input$mainAnalysisTabs, {
+    # Logika zůstává stejná, ale teď by měla fungovat správně
+    # díky správnému nastavení rv$data_after_outliers a rv$data_transformed
+    # ... (stejný kód jako předtím) ...
+    current_tab <- input$mainAnalysisTabs; req(current_tab); target_selected <- current_tab; error_message <- NULL
+    if (current_tab == "outlierAnalysisTab") { if (is.null(rv$data_prepared)) error_message <- "Nejprve načtěte data." else if (any(sapply(rv$data_prepared, function(x) any(is.na(x))))) error_message <- "Nejprve zpracujte chybějící hodnoty."; if(!is.null(error_message)) target_selected <- "dataPrepTab" else rv$outlier_step_visited <- TRUE }
+    else if (current_tab == "normalityTestTab") { if (is.null(rv$data_after_outliers) || !rv$outlier_step_visited) { error_message <- "Nejprve projděte krok Odlehlé hodnoty."; target_selected <- if (!is.null(rv$data_prepared) && !any(sapply(rv$data_prepared, function(x) any(is.na(x))))) "outlierAnalysisTab" else "dataPrepTab" } }
+    else if (current_tab == "analysisHubTab") { if (is.null(rv$data_transformed)) { error_message <- "Nejprve projděte krok Normalita."; target_selected <- "normalityTestTab" } } # Zjednodušená podmínka
+    else if (current_tab %in% c("comparisonTab", "correlationTab", "regressionTab", "dependencyTab")) { if (is.null(rv$data_transformed)) { error_message <- "Nejprve projděte všemi kroky přípravy dat a vyberte analýzu v Hubu."; target_selected <- "analysisHubTab" } } # Změněno cílení
+    if (!is.null(error_message) && current_tab != target_selected) { print(paste("Hlavní App: Neplatné přepnutí na", current_tab, "- Vracím na", target_selected)); showNotification(error_message, type = "warning", duration = 7); updateTabsetPanel(session, "mainAnalysisTabs", selected = target_selected) }
+  }, ignoreNULL = TRUE, ignoreInit = TRUE)
+  
+  
+  # --- Volání serverů analytických modulů ---
+  # Všechny moduly nyní dostávají rv$data_transformed a rv$col_types
+  common_reactive_data <- reactive({ req(rv$data_transformed, cancelOutput = TRUE); rv$data_transformed })
+  common_reactive_col_types <- reactive({ req(rv$col_types, cancelOutput = TRUE); rv$col_types })
+  
+  regressionServer(id = "regression_module", reactive_data = common_reactive_data, reactive_col_types = common_reactive_col_types)
+  correlationServer(id = "correlation_analysis", reactive_data = common_reactive_data, reactive_col_types = common_reactive_col_types)
+  dependencyTestServer(id = "dependency_analysis", reactive_data = common_reactive_data, reactive_col_types = common_reactive_col_types)
+  comparisonServer(id = "comparison_analysis", reactive_data = common_reactive_data, reactive_col_types = common_reactive_col_types)
+  
+  
+  # --- Debug výstupy (lze odstranit) ---
+  # output$debug_comparison_data <- renderPrint({ ... })
+  
+} # Konec server funkce
+
+# --- Spuštění aplikace ---
+shinyApp(ui = ui, server = server)

@@ -1,0 +1,27 @@
+{
+    "id": "70367C62",
+    "path": "~/dp/app.R",
+    "project_path": "app.R",
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1744545606428.0,
+    "source_on_save": false,
+    "relative_order": 2,
+    "properties": {
+        "tempName": "Untitled1",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "108,35",
+        "scrollLine": "95"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1745154461,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1745154461092,
+    "read_only": false,
+    "read_only_alternatives": []
+}
